@@ -18,7 +18,6 @@
 import copy
 import datetime
 import logging
-import re
 from collections import OrderedDict, UserDict
 from decimal import Decimal, DivisionByZero, InvalidOperation
 from itertools import groupby
@@ -100,15 +99,23 @@ class QueryFilter(UserDict):
         self.operation = operation
         self.parameter = parameter
 
+    def __eq__(self, other):
+        """Exact comparison."""
+        return self.data == other.data
+
+    def __repr__(self):
+        """Return string representation."""
+        return str(self.composed_dict())
+
+    def composed_dict(self):
+        """Return a dict formatted for Django's ORM."""
+        return {self.composed_query_string(): self.parameter}
+
     def composed_query_string(self):
         """Return compiled query string."""
         fields = [entry for entry in [self.table, self.field, self.operation]
                   if entry is not None]
         return self.SEP.join(fields)
-
-    def composed_dict(self):
-        """Return a dict formatted for Django's ORM."""
-        return {self.composed_query_string(): self.parameter}
 
     def from_string(self, query_string):
         """Parse a string representing a filter.
@@ -134,27 +141,77 @@ class QueryFilter(UserDict):
             raise TypeError(message)
         return self
 
-    def __repr__(self):
-        """Return string representation."""
-        return str(self.composed_dict())
-
 
 class QueryFilterCollection(object):
-    """Object representing a set of filters for a query."""
+    """Object representing a set of filters for a query.
+
+    This object behaves in list-like ways.
+    """
 
     def __init__(self, filters=None):
-        """Constructor."""
+        """Constructor.
+
+        Args:
+            filters (list) a list of QueryFilter instances.
+        """
         if filters is None:
             self._filters = list()    # a list of QueryFilter objects
         else:
-            for item in filters:
-                if not isinstance(item, QueryFilter):
-                    message = 'Filters list must be instances of QueryFilter.'
-                    raise TypeError(message)
+            if not isinstance(filters, list):
+                raise TypeError('filters must be a list')
+
+            if not all(isinstance(item, QueryFilter) for item in filters):
+                raise TypeError('Filters list must contain QueryFilters.')
+
             self._filters = filters
 
-    def add(self, query_filter=None, table=None, field=None, operation=None, parameter=None):
+    def __contains__(self, item):
+        """Return a boolean about whether `item` is in the collection.
+
+        This will do both an exact and a fuzzy match. Exact matches are
+        preferred over fuzzy matches. However, if there is no exact match,
+        __contains__ will return `True` if there is an object that contains all
+        of the same properties as `item`, even if additional properties are
+        set on the object in our collection. (See: `QueryFilterCollection.get()`)
+
+        Args:
+            item (QueryFilter or dict) object to search for.
+
+        Returns:
+            (bool) Whether a matching object was found.
+
+        """
+        if isinstance(item, QueryFilter):
+            return item in self._filters
+        if isinstance(item, dict) and self.get(item):
+            return True
+        return False
+
+    def __iter__(self):
+        """Return an iterable of the collection."""
+        return self._filters.__iter__()
+
+    def __getitem__(self, key):
+        """Return object identified by key.
+
+        Args:
+            key (int) the index of the QueryFilter to return.
+        """
+        return self._filters[key]
+
+    def __repr__(self):
+        """Return string representation."""
+        out = f'{self.__class__}: '
+        for filt in self._filters:
+            out += filt.__repr__() + ', '
+        return out
+
+    def add(self, query_filter=None, table=None, field=None,
+            operation=None, parameter=None):
         """Add a query filter to the collection.
+
+        QueryFilterCollection does try to maintain filter uniqueness. A new
+        object will not be added to the collection if it already exists.
 
         Args:
             query_filter (QueryFilter) a QueryFilter object
@@ -171,13 +228,14 @@ class QueryFilterCollection(object):
         if query_filter and (table or field or operation or parameter):
             raise AttributeError(error_message)
 
-        if query_filter:
+        if query_filter and query_filter not in self:
             self._filters.append(query_filter)
 
         if (table or field or operation or parameter):
             qf = QueryFilter(table=table, field=field, operation=operation,
                              parameter=parameter)
-            self._filters.append(qf)
+            if qf not in self:
+                self._filters.append(qf)
 
     def compose(self):
         """Compose filters into a dict for submitting to Django's ORM."""
@@ -187,12 +245,69 @@ class QueryFilterCollection(object):
                 out.update(filt.composed_dict())
         return out
 
-    def __repr__(self):
-        """Return string representation."""
-        out = f'{self.__class__}: '
-        for filt in self._filters:
-            out += filt.__repr__() + ', '
-        return out
+    def delete(self, query_filter=None, table=None, field=None,
+               operation=None, parameter=None):
+        """Delete a query filter from the collection.
+
+        Args:
+            query_filter (QueryFilter) a QueryFilter object
+
+            - or -
+
+            table (str)  db table name
+            field (str)  db field/row name
+            operation (str) db operation
+            parameter (object) query object
+
+        """
+        error_message = 'query_filter can not be defined with other parameters'
+        if query_filter and (table or field or operation or parameter):
+            raise AttributeError(error_message)
+
+        if query_filter and query_filter in self:
+            self._filters.remove(query_filter)
+
+        if (table or field or operation or parameter):
+            qf = QueryFilter(table=table, field=field, operation=operation,
+                             parameter=parameter)
+            if qf in self:
+                self._filters.remove(qf)
+
+    def get(self, search):
+        """Retrieve the first matching filter in the collection.
+
+        This is a "fuzzy" search. This method looks for an object that matches
+        all key-value pairs of `search` with an object in the collection. The
+        matched object may have additional properties set to a non-None value.
+
+        Args:
+            search (dict) A dictionary of filter parameters to search for.
+
+        Example:
+
+            These examples are in order of least-specific (most likely to have
+            more than one result) to most-specific (most likely to have exactly
+            one result).
+
+            QueryFilterCollection.get({'operation': 'contains'})
+
+            QueryFilterCollection.get({'table': 'mytable', 'operation': 'gte'})
+
+            QueryFilterCollection.get({'table': 'mytable',
+                                       'field': 'myfield',
+                                       'operation': 'in'})
+
+        """
+        for idx, filt in enumerate(self._filters):
+            filter_values = [filt.get(key) for key in search.keys()
+                             if filt.get(key)]
+            search_values = [search.get(key) for key in search.keys()
+                             if search.get(key)]
+            filter_values.sort()
+            search_values.sort()
+            if search_values == filter_values:
+                return (idx, filt)
+        return None
 
 
 class ReportQueryHandler(object):
@@ -512,14 +627,14 @@ class ReportQueryHandler(object):
 
         if self.is_sum:
             # Summary table is already wrapped up at the date level
-            start_filter = QueryFilter(table='usage_start', operation='gte',
+            start_filter = QueryFilter(field='usage_start', operation='gte',
                                        parameter=self.start_datetime.date())
-            end_filter = QueryFilter(table='usage_start', operation='lte',
+            end_filter = QueryFilter(field='usage_start', operation='lte',
                                      parameter=self.end_datetime.date())
         else:
-            start_filter = QueryFilter(table='usage_start', operation='gte',
+            start_filter = QueryFilter(field='usage_start', operation='gte',
                                        parameter=self.start_datetime)
-            end_filter = QueryFilter(table='usage_end', operation='lte',
+            end_filter = QueryFilter(field='usage_end', operation='lte',
                                      parameter=self.end_datetime)
         filters.add(query_filter=start_filter)
         filters.add(query_filter=end_filter)
@@ -539,8 +654,8 @@ class ReportQueryHandler(object):
                 filt.parameter = list_
             filters.add(filt)
 
-        LOG.debug(f'Filters: {filters.compose()}')
-        return filters.compose()
+        LOG.debug(f'Filters: {filters}')
+        return filters
 
     def _get_group_by(self):
         """Create list for group_by parameters."""
@@ -742,7 +857,7 @@ class ReportQueryHandler(object):
         data = []
 
         with tenant_context(self.tenant):
-            query = AWSCostEntryLineItemDailySummary.objects.filter(**self.query_filter)
+            query = AWSCostEntryLineItemDailySummary.objects.filter(**self.query_filter.compose())
 
             query_annotations = self._get_annotations()
             query_data = query.annotate(**query_annotations)
@@ -813,7 +928,7 @@ class ReportQueryHandler(object):
         data = []
 
         with tenant_context(self.tenant):
-            query = AWSCostEntryLineItem.objects.filter(**self.query_filter)
+            query = AWSCostEntryLineItem.objects.filter(**self.query_filter.compose())
 
             query_annotations = self._get_annotations()
             query_data = query.annotate(**query_annotations)
@@ -915,23 +1030,18 @@ class ReportQueryHandler(object):
         else:
             date_delta = datetime.timedelta(days=10)
 
-        _start = delta_filter.get('usage_start__gte')
-        _end = delta_filter.get('usage_end__lte')
-        if self.is_sum:
-            # Override as summary table is date based, not timestamp
-            _end = delta_filter.get('usage_start__lte')
+        s_idx, _start = delta_filter.get({'field': 'usage_start', 'operation': 'gte'})
+        # summary table is date based, not timestamp
+        end_field = 'usage_start' if self.is_sum else 'usage_end'
+        e_idx, _end = delta_filter.get({'field': end_field, 'operation': 'lte'})
 
-        delta_filter['usage_start__gte'] = _start - date_delta
+        delta_filter[s_idx].parameter = _start.parameter - date_delta
+        delta_filter[e_idx].parameter = _end.parameter - date_delta
 
-        if self.is_sum:
-            delta_filter['usage_start__lte'] = _end - date_delta
-            previous_query = AWSCostEntryLineItemDailySummary.objects.filter(
-                **delta_filter
-            )
-        else:
-            delta_filter['usage_end__lte'] = _end - date_delta
-            previous_query = AWSCostEntryLineItem.objects.filter(**delta_filter)
-
+        # construct new query
+        obj = AWSCostEntryLineItemDailySummary if self.is_sum else \
+            AWSCostEntryLineItem
+        previous_query = getattr(obj, 'objects').filter(**delta_filter.compose())
         return previous_query
 
     def _create_previous_totals(self, previous_query, query_group_by):
@@ -950,6 +1060,7 @@ class ReportQueryHandler(object):
             date_delta = datetime.timedelta(days=30)
         else:
             date_delta = datetime.timedelta(days=10)
+
         # Added deltas for each grouping
         # e.g. date, account, region, availability zone, et cetera
         query_annotations = self._get_annotations()
@@ -978,28 +1089,22 @@ class ReportQueryHandler(object):
             (dict) The aggregated totals for the query
 
         """
-        filter_fields = [
-            'availability_zone',
-            'region',
-            'usage_account_id',
-            'product_code'
-        ]
-        total_filter = {}
+        # create a new filter collection without usage_start or usage_end.
+        # AWSCostEntryLineItemAggregates uses time_scope_value instead.
+        filter_fields = ['availability_zone', 'region', 'usage_account_id',
+                         'product_code']
+        total_filter = QueryFilterCollection()
+        for filt in self.query_filter:
+            if filt.field in filter_fields:
+                total_filter.add(filt)
 
-        for field in filter_fields:
-            total_filter.update(
-                {key: value for key, value in self.query_filter.items()
-                 if re.match(field, key)}
-            )
-
-        total_filter['time_scope_value'] = self.get_query_param_data(
-            'filter',
-            'time_scope_value',
-            0
-        )
-        total_filter['report_type'] = self._report_type
+        total_filter.add(field='time_scope_value',
+                         parameter=self.get_query_param_data('filter',
+                                                             'time_scope_value',
+                                                             0))
+        total_filter.add(field='report_type', parameter=self._report_type)
         total_query = AWSCostEntryLineItemAggregates.objects.filter(
-            **total_filter
+            **total_filter.compose()
         )
         if self.count:
             query_sum = total_query.aggregate(

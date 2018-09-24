@@ -24,6 +24,7 @@ from itertools import groupby
 
 from dateutil import relativedelta
 from django.db.models import (F,
+                              Max,
                               Sum,
                               Value,
                               Window)
@@ -625,17 +626,10 @@ class ReportQueryHandler(object):
 
         region_filter = QueryFilter(table=cep_table, field='region', operation='in')
 
-        if self.is_sum:
-            # Summary table is already wrapped up at the date level
-            start_filter = QueryFilter(field='usage_start', operation='gte',
-                                       parameter=self.start_datetime.date())
-            end_filter = QueryFilter(field='usage_start', operation='lte',
-                                     parameter=self.end_datetime.date())
-        else:
-            start_filter = QueryFilter(field='usage_start', operation='gte',
-                                       parameter=self.start_datetime)
-            end_filter = QueryFilter(field='usage_end', operation='lte',
-                                     parameter=self.end_datetime)
+        start_filter = QueryFilter(field='usage_start', operation='gte',
+                                   parameter=self.start_datetime)
+        end_filter = QueryFilter(field='usage_end', operation='lte',
+                                 parameter=self.end_datetime)
         filters.add(query_filter=start_filter)
         filters.add(query_filter=end_filter)
 
@@ -863,14 +857,14 @@ class ReportQueryHandler(object):
             query_data = query.annotate(**query_annotations)
 
             query_group_by = ['date'] + self._get_group_by()
-            query_group_by_with_units = query_group_by + ['units']
 
             query_order_by = ('-date', )
             if self.order_field != 'delta':
                 query_order_by += (self.order,)
 
-            query_data = query_data.values(*query_group_by_with_units)\
-                .annotate(total=Sum(self.aggregate_key))
+            query_data = query_data.values(*query_group_by)\
+                .annotate(total=Sum(self.aggregate_key))\
+                .annotate(units=Max(self.units_key))
 
             if self.count:
                 # This is a sum because the summary table already
@@ -1031,9 +1025,7 @@ class ReportQueryHandler(object):
             date_delta = datetime.timedelta(days=10)
 
         s_idx, _start = delta_filter.get({'field': 'usage_start', 'operation': 'gte'})
-        # summary table is date based, not timestamp
-        end_field = 'usage_start' if self.is_sum else 'usage_end'
-        e_idx, _end = delta_filter.get({'field': end_field, 'operation': 'lte'})
+        e_idx, _end = delta_filter.get({'field': 'usage_end', 'operation': 'lte'})
 
         delta_filter[s_idx].parameter = _start.parameter - date_delta
         delta_filter[e_idx].parameter = _end.parameter - date_delta

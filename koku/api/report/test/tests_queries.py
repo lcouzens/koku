@@ -263,7 +263,7 @@ class QueryFilterCollectionTest(TestCase):
 
         response = qf_coll.get({'table': self.fake.word(),
                                 'field': self.fake.word(),
-                                'parameter'=self.fake.word()})
+                                'parameter': self.fake.word()})
         self.assertIsNone(response)
 
 
